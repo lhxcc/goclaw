@@ -7,15 +7,18 @@ All notable changes to this project will be documented in this file.
 ### Added
 - `agent` command: Add `--agent` flag for specifying agent ID
 - `agent` command: Add `--max-iterations` flag to limit agent loop iterations (default: 15)
+- `agent` command: Add `--stream` flag for streaming output support
 - `agent` command: Add validation requiring either `--agent` or `--session-id` flag
 - Agent loop: Add context cancellation check to prevent hanging on timeout
 - Agent loop: Add max iterations check to prevent infinite loops
+- Agent: Add streaming events (`EventStreamContent`, `EventStreamThinking`, `EventStreamFinal`, `EventStreamDone`)
 
 ### Changed
 - `agent` command: `--timeout` default changed from 120 to 600 seconds
 - `agent` command: `--thinking` changed from boolean to string level (off|minimal|low|medium|high)
 - `agent` command: `--message` now supports `-m` shorthand
 - `agent` command: Updated flag descriptions to match openclaw CLI format
+- Orchestrator: `streamAssistantResponse` now uses `ChatStream` for streaming providers
 
 ## 2026-02-27
 
