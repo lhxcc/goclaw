@@ -178,6 +178,7 @@ type LoopConfig struct {
 	SessionMgr    *session.Manager
 	MaxIterations int
 	SessionID     string
+	ToolTimeout   time.Duration // Timeout for individual tool executions (default: 3 minutes)
 
 	// Hooks for message transformation
 	ConvertToLLM     func([]AgentMessage) ([]providers.Message, error)

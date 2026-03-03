@@ -6,6 +6,7 @@ import (
 	"io"
 	"os/exec"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -88,37 +89,111 @@ func (t *ShellTool) Exec(ctx context.Context, params map[string]interface{}) (st
 
 // execDirect 直接执行命令
 func (t *ShellTool) execDirect(ctx context.Context, command string) (string, error) {
-	// 创建带超时的上下文
-	cmdCtx, cancel := context.WithTimeout(ctx, t.timeout)
-	defer cancel()
-
 	// 执行命令
-	cmd := exec.CommandContext(cmdCtx, "sh", "-c", command)
+	cmd := exec.Command("sh", "-c", command)
 	if t.workingDir != "" {
 		cmd.Dir = t.workingDir
 	}
 
 	// 设置进程组，确保能够杀死整个进程树
-	// 这解决了超时后子进程继续运行导致输出管道阻塞的问题
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Setpgid: true,
 	}
 
 	// 获取输出管道
-	output, err := cmd.CombinedOutput()
+	stdout, err := cmd.StdoutPipe()
 	if err != nil {
-		// 检查是否是超时错误
-		if cmdCtx.Err() == context.DeadlineExceeded {
-			// context 已超时，确保进程组被清理
-			if cmd.Process != nil {
-				_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-			}
-			return "", fmt.Errorf("command timed out after %v", t.timeout)
-		}
-		return "", fmt.Errorf("command failed: %w, output: %s", err, string(output))
+		return "", fmt.Errorf("failed to create stdout pipe: %w", err)
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		stdout.Close()
+		return "", fmt.Errorf("failed to create stderr pipe: %w", err)
 	}
 
-	return string(output), nil
+	// 启动命令
+	if err := cmd.Start(); err != nil {
+		stdout.Close()
+		stderr.Close()
+		return "", fmt.Errorf("failed to start command: %w", err)
+	}
+
+	// 使用 channel 和 goroutine 实现超时控制
+	type result struct {
+		output []byte
+		err    error
+	}
+
+	resultCh := make(chan result, 1)
+	go func() {
+		defer close(resultCh)
+
+		// 读取输出 - 分别读取以避免死锁
+		var stdoutBuf, stderrBuf []byte
+		var stdoutErr, stderrErr error
+
+		// 使用 goroutine 并行读取 stdout 和 stderr
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		go func() {
+			defer wg.Done()
+			stdoutBuf, stdoutErr = io.ReadAll(stdout)
+			stdout.Close()
+		}()
+
+		go func() {
+			defer wg.Done()
+			stderrBuf, stderrErr = io.ReadAll(stderr)
+			stderr.Close()
+		}()
+
+		wg.Wait()
+
+		// 等待命令完成
+		waitErr := cmd.Wait()
+
+		// 组合输出
+		var outputBuf []byte
+		outputBuf = append(outputBuf, stdoutBuf...)
+		outputBuf = append(outputBuf, stderrBuf...)
+
+		// 确定返回的错误
+		resultErr := waitErr
+		if stdoutErr != nil {
+			resultErr = stdoutErr
+		} else if stderrErr != nil {
+			resultErr = stderrErr
+		}
+
+		resultCh <- result{output: outputBuf, err: resultErr}
+	}()
+
+	// 等待结果或超时
+	select {
+	case res := <-resultCh:
+		if res.err != nil {
+			return "", fmt.Errorf("command failed: %w, output: %s", res.err, string(res.output))
+		}
+		return string(res.output), nil
+	case <-time.After(t.timeout):
+		// 超时：强制杀死进程组
+		if cmd.Process != nil {
+			// 先尝试优雅关闭（SIGTERM）
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+			// 给进程一点时间清理
+			time.Sleep(100 * time.Millisecond)
+			// 再强制杀死（SIGKILL）
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		return "", fmt.Errorf("command timed out after %v", t.timeout)
+	case <-ctx.Done():
+		// 父 context 被取消
+		if cmd.Process != nil {
+			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		}
+		return "", ctx.Err()
+	}
 }
 
 // execInSandbox 在 Docker 容器中执行命令

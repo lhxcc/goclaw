@@ -19,6 +19,12 @@ const (
 	AgentIDContextKey    contextKey = "agent_id"
 )
 
+// toolResultPair is used to pass tool execution results from goroutines
+type toolResultPair struct {
+	result *ToolResult
+	err    error
+}
+
 // Orchestrator manages the agent execution loop
 // Based on pi-mono's agent-loop.ts design
 //
@@ -418,13 +424,40 @@ func (o *Orchestrator) executeToolCalls(ctx context.Context, toolCalls []ToolCal
 			// Create context with session key for tools to access
 			toolCtx := context.WithValue(ctx, SessionKeyContextKey, state.SessionKey)
 
-			// Execute tool with streaming support
-			result, err = tool.Execute(toolCtx, tc.Arguments, func(partial ToolResult) {
-				// Emit update event
-				o.emit(NewEvent(EventToolExecutionUpdate).
-					WithToolExecution(tc.ID, tc.Name, tc.Arguments).
-					WithToolResult(&partial, false))
-			})
+			// Add timeout for tool execution (safety net in case tool doesn't handle its own timeout)
+			toolTimeout := o.config.ToolTimeout
+			if toolTimeout <= 0 {
+				toolTimeout = 3 * time.Minute // default 3 minutes
+			}
+			execCtx, execCancel := context.WithTimeout(toolCtx, toolTimeout)
+			defer execCancel()
+
+			// Execute tool with streaming support in a goroutine to handle timeout properly
+			resultCh := make(chan *toolResultPair, 1)
+			go func() {
+				r, e := tool.Execute(execCtx, tc.Arguments, func(partial ToolResult) {
+					// Emit update event
+					o.emit(NewEvent(EventToolExecutionUpdate).
+						WithToolExecution(tc.ID, tc.Name, tc.Arguments).
+						WithToolResult(&partial, false))
+				})
+				resultCh <- &toolResultPair{result: &r, err: e}
+			}()
+
+			// Wait for result or timeout
+			select {
+			case pair := <-resultCh:
+				if pair.result != nil {
+					result = *pair.result
+				}
+				err = pair.err
+			case <-execCtx.Done():
+				err = fmt.Errorf("tool execution timed out after %v", toolTimeout)
+				logger.Error("Tool execution timeout",
+					zap.String("tool_id", tc.ID),
+					zap.String("tool_name", tc.Name),
+					zap.Duration("timeout", toolTimeout))
+			}
 
 			state.RemovePendingTool(tc.ID)
 		}
